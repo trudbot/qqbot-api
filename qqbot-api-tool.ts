@@ -1,8 +1,5 @@
-export type QQBotTarget =
-  | { type: "c2c"; id: string }
-  | { type: "group"; id: string }
-  | { type: "channel"; id: string }
-  | { type: "dm"; guildId: string };
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 
 export interface QQBotApiToolOptions {
   appId: string;
@@ -11,20 +8,13 @@ export interface QQBotApiToolOptions {
   logger?: Pick<Console, "log" | "warn" | "error">;
   apiBaseUrl?: string;
   tokenBaseUrl?: string;
-  intents?: number;
 }
 
 export interface QQBotMessageEvent {
-  eventType: string;
-  scene: "c2c" | "group" | "channel" | "dm";
   messageId: string;
   text: string;
+  openid: string;
   timestamp?: string;
-  senderId?: string;
-  openid?: string;
-  groupOpenid?: string;
-  channelId?: string;
-  guildId?: string;
   attachments: QQBotAttachment[];
   raw: unknown;
 }
@@ -81,7 +71,6 @@ interface WSPayload<T = unknown> {
 
 const DEFAULT_API_BASE = "https://api.sgroup.qq.com";
 const DEFAULT_TOKEN_BASE = "https://bots.qq.com";
-
 const WS_OPEN = 1;
 const OP_DISPATCH = 0;
 const OP_HEARTBEAT = 1;
@@ -90,19 +79,8 @@ const OP_RECONNECT = 7;
 const OP_INVALID_SESSION = 9;
 const OP_HELLO = 10;
 const OP_HEARTBEAT_ACK = 11;
-
-const INTENTS = {
-  PUBLIC_GUILD_MESSAGES: 1 << 30,
-  DIRECT_MESSAGE: 1 << 12,
-  GROUP_AND_C2C: 1 << 25,
-  INTERACTION: 1 << 26,
-};
-
-const DEFAULT_INTENTS =
-  INTENTS.PUBLIC_GUILD_MESSAGES |
-  INTENTS.DIRECT_MESSAGE |
-  INTENTS.GROUP_AND_C2C |
-  INTENTS.INTERACTION;
+const C2C_INTENT = 1 << 25;
+const IMAGE_FILE_TYPE = 1;
 
 export class QQBotApiTool {
   private readonly appId: string;
@@ -111,7 +89,6 @@ export class QQBotApiTool {
   private readonly logger: Pick<Console, "log" | "warn" | "error">;
   private readonly apiBaseUrl: string;
   private readonly tokenUrl: string;
-  private readonly intents: number;
   private tokenCache: TokenCache | null = null;
   private tokenPromise: Promise<string> | null = null;
   private ws: WebSocketLike | null = null;
@@ -133,7 +110,6 @@ export class QQBotApiTool {
     this.logger = options.logger ?? console;
     this.apiBaseUrl = trimTrailingSlash(options.apiBaseUrl ?? DEFAULT_API_BASE);
     this.tokenUrl = `${trimTrailingSlash(options.tokenBaseUrl ?? DEFAULT_TOKEN_BASE)}/app/getAppAccessToken`;
-    this.intents = options.intents ?? DEFAULT_INTENTS;
   }
 
   onMessage(handler: QQBotMessageHandler): this {
@@ -158,29 +134,27 @@ export class QQBotApiTool {
   }
 
   async reply(event: QQBotMessageEvent, text: string): Promise<QQBotMessageResponse> {
-    if (event.scene === "c2c" && event.openid) return this.sendC2CMessage(event.openid, text, event.messageId);
-    if (event.scene === "group" && event.groupOpenid) return this.sendGroupMessage(event.groupOpenid, text, event.messageId);
-    if (event.scene === "channel" && event.channelId) return this.sendChannelMessage(event.channelId, text, event.messageId);
-    if (event.scene === "dm" && event.guildId) return this.sendDmMessage(event.guildId, text, event.messageId);
-    throw new Error(`Cannot reply to event: missing target fields for scene ${event.scene}`);
+    return this.sendPrivateText(event.openid, text, event.messageId);
   }
 
-  async sendText(target: QQBotTarget, text: string): Promise<QQBotMessageResponse> {
-    if (target.type === "c2c") return this.sendC2CMessage(target.id, text);
-    if (target.type === "group") return this.sendGroupMessage(target.id, text);
-    if (target.type === "channel") return this.sendChannelMessage(target.id, text);
-    return this.sendDmMessage(target.guildId, text);
+  async replyImage(event: QQBotMessageEvent, image: string): Promise<QQBotMessageResponse> {
+    return this.sendPrivateImageTo(event.openid, image, event.messageId);
   }
 
   async sendPrivate(text: string, openid = this.userOpenid): Promise<QQBotMessageResponse> {
     if (!openid) throw new Error("sendPrivate requires userOpenid in constructor or as the second argument");
-    return this.sendC2CMessage(openid, text);
+    return this.sendPrivateText(openid, text);
+  }
+
+  async sendPrivateImage(image: string, openid = this.userOpenid): Promise<QQBotMessageResponse> {
+    if (!openid) throw new Error("sendPrivateImage requires userOpenid in constructor or as the second argument");
+    return this.sendPrivateImageTo(openid, image);
   }
 
   async sendPrivateStream(text: string, options: QQBotStreamOptions = {}): Promise<QQBotMessageResponse> {
     const openid = options.openid ?? this.userOpenid;
     if (!openid) throw new Error("sendPrivateStream requires userOpenid in constructor or options.openid");
-    return this.sendC2CStreamMessage(openid, text, options);
+    return this.sendPrivateStreamTo(openid, text, options);
   }
 
   private async getAccessToken(): Promise<string> {
@@ -297,7 +271,7 @@ export class QQBotApiTool {
       op: OP_IDENTIFY,
       d: {
         token: `QQBot ${accessToken}`,
-        intents: this.intents,
+        intents: C2C_INTENT,
         shard: [0, 1],
       },
     });
@@ -348,11 +322,40 @@ export class QQBotApiTool {
     return data.url;
   }
 
-  private async sendC2CMessage(openid: string, content: string, msgId?: string): Promise<QQBotMessageResponse> {
+  private async sendPrivateText(openid: string, content: string, msgId?: string): Promise<QQBotMessageResponse> {
     return this.apiRequest("POST", `/v2/users/${encodeURIComponent(openid)}/messages`, buildTextBody(content, msgId));
   }
 
-  private async sendC2CStreamMessage(openid: string, content: string, options: QQBotStreamOptions): Promise<QQBotMessageResponse> {
+  private async sendPrivateImageTo(openid: string, image: string, msgId?: string): Promise<QQBotMessageResponse> {
+    const fileInfo = await this.uploadPrivateImage(openid, image);
+    return this.apiRequest("POST", `/v2/users/${encodeURIComponent(openid)}/messages`, {
+      msg_type: 7,
+      msg_seq: msgId ? Date.now() % 1_000_000 : 1,
+      media: { file_info: fileInfo },
+      ...(msgId ? { msg_id: msgId } : {}),
+    });
+  }
+
+  private async uploadPrivateImage(openid: string, image: string): Promise<string> {
+    const body = isHttpUrl(image)
+      ? {
+          file_type: IMAGE_FILE_TYPE,
+          url: image,
+          srv_send_msg: false,
+        }
+      : {
+          file_type: IMAGE_FILE_TYPE,
+          file_data: await fs.readFile(image, "base64"),
+          srv_send_msg: false,
+          file_name: path.basename(image),
+        };
+
+    const result = await this.apiRequest<{ file_info?: string }>("POST", `/v2/users/${encodeURIComponent(openid)}/files`, body);
+    if (!result.file_info) throw new Error("QQ image upload response missing file_info");
+    return result.file_info;
+  }
+
+  private async sendPrivateStreamTo(openid: string, content: string, options: QQBotStreamOptions): Promise<QQBotMessageResponse> {
     const chunks = splitByLines(content, options.chunkSize ?? 50);
     const intervalMs = options.intervalMs ?? 100;
     let streamId: string | null = null;
@@ -388,18 +391,6 @@ export class QQBotApiTool {
     });
   }
 
-  private async sendGroupMessage(groupOpenid: string, content: string, msgId?: string): Promise<QQBotMessageResponse> {
-    return this.apiRequest("POST", `/v2/groups/${encodeURIComponent(groupOpenid)}/messages`, buildTextBody(content, msgId));
-  }
-
-  private async sendChannelMessage(channelId: string, content: string, msgId?: string): Promise<QQBotMessageResponse> {
-    return this.apiRequest("POST", `/channels/${encodeURIComponent(channelId)}/messages`, buildTextBody(content, msgId));
-  }
-
-  private async sendDmMessage(guildId: string, content: string, msgId?: string): Promise<QQBotMessageResponse> {
-    return this.apiRequest("POST", `/dms/${encodeURIComponent(guildId)}/messages`, buildTextBody(content, msgId));
-  }
-
   private async apiRequest<T>(method: string, path: string, body?: unknown, token?: string): Promise<T> {
     const accessToken = token ?? await this.getAccessToken();
     const response = await fetch(`${this.apiBaseUrl}${path}`, {
@@ -426,69 +417,19 @@ export class QQBotApiTool {
 }
 
 export function normalizeMessageEvent(payload: WSPayload): QQBotMessageEvent | null {
-  const eventType = payload.t ?? "";
+  if (payload.t !== "C2C_MESSAGE_CREATE") return null;
   const data = payload.d as Record<string, any> | undefined;
-  if (!data) return null;
+  const openid = data?.author?.user_openid ?? data?.author?.id;
+  if (!data || !openid) return null;
 
-  if (eventType === "C2C_MESSAGE_CREATE") {
-    return {
-      eventType,
-      scene: "c2c",
-      messageId: String(data.id ?? ""),
-      text: String(data.content ?? ""),
-      timestamp: data.timestamp,
-      senderId: data.author?.id,
-      openid: data.author?.user_openid ?? data.author?.id,
-      attachments: Array.isArray(data.attachments) ? data.attachments : [],
-      raw: data,
-    };
-  }
-
-  if (eventType === "GROUP_AT_MESSAGE_CREATE" || eventType === "GROUP_MESSAGE_CREATE") {
-    return {
-      eventType,
-      scene: "group",
-      messageId: String(data.id ?? ""),
-      text: String(data.content ?? ""),
-      timestamp: data.timestamp,
-      senderId: data.author?.member_openid ?? data.author?.id,
-      openid: data.author?.member_openid ?? data.author?.id,
-      groupOpenid: data.group_openid ?? data.group_id,
-      attachments: Array.isArray(data.attachments) ? data.attachments : [],
-      raw: data,
-    };
-  }
-
-  if (eventType === "AT_MESSAGE_CREATE") {
-    return {
-      eventType,
-      scene: "channel",
-      messageId: String(data.id ?? ""),
-      text: String(data.content ?? ""),
-      timestamp: data.timestamp,
-      senderId: data.author?.id,
-      channelId: data.channel_id,
-      guildId: data.guild_id,
-      attachments: Array.isArray(data.attachments) ? data.attachments : [],
-      raw: data,
-    };
-  }
-
-  if (eventType === "DIRECT_MESSAGE_CREATE") {
-    return {
-      eventType,
-      scene: "dm",
-      messageId: String(data.id ?? ""),
-      text: String(data.content ?? ""),
-      timestamp: data.timestamp,
-      senderId: data.author?.id,
-      guildId: data.guild_id,
-      attachments: Array.isArray(data.attachments) ? data.attachments : [],
-      raw: data,
-    };
-  }
-
-  return null;
+  return {
+    messageId: String(data.id ?? ""),
+    text: String(data.content ?? ""),
+    timestamp: data.timestamp,
+    openid,
+    attachments: Array.isArray(data.attachments) ? data.attachments : [],
+    raw: data,
+  };
 }
 
 function buildTextBody(content: string, msgId?: string): Record<string, unknown> {
@@ -537,6 +478,10 @@ async function webSocketDataToString(data: unknown): Promise<string> {
   return String(data);
 }
 
+function isHttpUrl(value: string): boolean {
+  return value.startsWith("http://") || value.startsWith("https://");
+}
+
 function parseJson<T>(text: string): T | null {
   try {
     return JSON.parse(text) as T;
@@ -562,10 +507,11 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const bot = new QQBotApiTool({
     appId: process.env.QQBOT_APP_ID ?? "",
     clientSecret: process.env.QQBOT_CLIENT_SECRET ?? "",
+    userOpenid: process.env.QQBOT_USER_OPENID,
   });
 
   bot.onMessage(async (event, api) => {
-    console.log(`[qqbot] ${event.scene} ${event.openid ?? event.groupOpenid ?? event.channelId ?? event.guildId}: ${event.text}`);
+    console.log(`[qqbot] private ${event.openid}: ${event.text}`);
     if (event.text.trim() === "/ping") {
       await api.reply(event, "pong");
     }

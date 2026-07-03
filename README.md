@@ -1,19 +1,20 @@
 # qqbot-api
 
-一个极简 TypeScript QQ Bot API 工具类，基于 QQ Bot WebSocket Gateway 接收消息，并提供简单的发送 API。
+一个极简 TypeScript QQ Bot 私聊工具类：基于 QQ Bot WebSocket Gateway 在本地接收 C2C 私聊消息，并提供私聊文本、流式 Markdown、图片发送 API。
 
 特点：
 
-- 只支持 WebSocket 模式，本地运行即可接收 QQ 消息，不需要公网 Webhook。
-- 不依赖当前 OpenClaw 仓库代码。
+- 只支持 WebSocket 模式，本地运行即可接收 QQ 私聊消息，不需要公网 Webhook。
+- 只封装 C2C 私聊能力，避免群聊、频道、DM 等额外复杂度。
+- 不依赖 OpenClaw 仓库代码。
 - 不依赖第三方 WebSocket 包，要求 Node.js 24+。
-- 对外 API 尽量简单：`start`、`stop`、`onMessage`、`reply`、`sendPrivate`、`sendPrivateStream`、`sendText`。
+- 对外 API 简洁：`start`、`stop`、`onMessage`、`reply`、`replyImage`、`sendPrivate`、`sendPrivateImage`、`sendPrivateStream`。
 
 ## 环境要求
 
 - Node.js 24+
 - QQ Bot 的 `appId` 和 `clientSecret`
-- QQ Bot 已开通相应事件权限，例如私聊、群聊、频道消息等
+- QQ Bot 已开通 C2C 私聊消息事件权限
 
 ## 安装
 
@@ -21,7 +22,7 @@
 npm install
 ```
 
-本项目只把 `tsx` 和 Node 类型作为开发依赖，核心文件 `qqbot-api-tool.ts` 本身不依赖第三方运行时包。
+本项目只把 `tsx`、`typescript` 和 Node 类型作为开发依赖，核心文件 `qqbot-api-tool.ts` 本身不依赖第三方运行时包。
 
 ## 配置
 
@@ -39,7 +40,7 @@ QQBOT_CLIENT_SECRET=你的 appSecret
 QQBOT_USER_OPENID=可选，默认私聊用户 openid
 ```
 
-`QQBOT_USER_OPENID` 不是由 `appId` / `clientSecret` 计算出来的。它来自 QQ 消息事件里的 `author.user_openid`。如果要主动私信，必须先知道目标用户 openid，或者在收到消息后自己保存。
+`QQBOT_USER_OPENID` 不是由 `appId` / `clientSecret` 计算出来的。它来自 QQ 私聊消息事件里的 `author.user_openid`。如果要主动私信，必须先知道目标用户 openid，或者在收到消息后自己保存。
 
 ## 最小接收和回复示例
 
@@ -52,15 +53,35 @@ const bot = new QQBotApiTool({
 });
 
 bot.onMessage(async (event, api) => {
-  console.log("收到消息", event.scene, event.text);
+  console.log("收到私聊", event.openid, event.text);
 
-  await api.reply(event, "你好");
+  if (event.text.trim() === "/ping") {
+    await api.reply(event, "pong");
+  }
 });
 
 await bot.start();
 ```
 
-运行后，本地程序会主动连接 QQ WebSocket Gateway。QQ 平台会沿这条连接推送消息，所以不需要把本机 localhost 暴露给公网。
+运行后，本地程序会主动连接 QQ WebSocket Gateway。QQ 平台会沿这条连接推送私聊消息，所以不需要把本机 localhost 暴露给公网。
+
+## 回复图片
+
+`replyImage` 支持公网图片 URL 或本地图片路径：
+
+```ts
+bot.onMessage(async (event, api) => {
+  if (event.text.trim() === "/image") {
+    await api.replyImage(event, "./demo.png");
+  }
+});
+```
+
+使用 URL：
+
+```ts
+await api.replyImage(event, "https://example.com/demo.png");
+```
 
 ## 主动发送私信
 
@@ -80,6 +101,20 @@ await bot.sendPrivate("你好");
 
 ```ts
 await bot.sendPrivate("你好", "USER_OPENID");
+```
+
+## 主动发送图片私信
+
+发送本地图片：
+
+```ts
+await bot.sendPrivateImage("./demo.png");
+```
+
+发送公网图片 URL：
+
+```ts
+await bot.sendPrivateImage("https://example.com/demo.png", "USER_OPENID");
 ```
 
 ## 流式发送私信
@@ -115,31 +150,16 @@ await bot.sendPrivateStream(markdownText, {
 2. 多次发送 `state: 1` 的 markdown stream 分片。
 3. 最后发送 `state: 10`、`reset: true` 的完整文本收尾。
 
-## 通用文本发送
-
-```ts
-await bot.sendText({ type: "c2c", id: "USER_OPENID" }, "你好");
-await bot.sendText({ type: "group", id: "GROUP_OPENID" }, "群消息");
-await bot.sendText({ type: "channel", id: "CHANNEL_ID" }, "频道消息");
-await bot.sendText({ type: "dm", guildId: "GUILD_ID" }, "频道私信");
-```
-
 ## 消息事件结构
 
-`onMessage` 收到的事件大致如下：
+`onMessage` 只会收到 C2C 私聊事件：
 
 ```ts
 interface QQBotMessageEvent {
-  eventType: string;
-  scene: "c2c" | "group" | "channel" | "dm";
   messageId: string;
   text: string;
+  openid: string;
   timestamp?: string;
-  senderId?: string;
-  openid?: string;
-  groupOpenid?: string;
-  channelId?: string;
-  guildId?: string;
   attachments: QQBotAttachment[];
   raw: unknown;
 }
@@ -148,10 +168,9 @@ interface QQBotMessageEvent {
 常用字段：
 
 - `event.text`：消息文本。
-- `event.scene`：消息场景。
-- `event.openid`：私聊用户或群成员 openid。
-- `event.groupOpenid`：群 openid。
+- `event.openid`：私聊用户 openid。
 - `event.messageId`：回复当前消息时使用。
+- `event.attachments`：QQ 事件里携带的附件信息。
 - `event.raw`：QQ 原始事件数据。
 
 ## API 速览
@@ -164,9 +183,10 @@ await bot.start();
 bot.stop();
 
 await bot.reply(event, "你好");
+await bot.replyImage(event, "./demo.png");
 await bot.sendPrivate("你好");
+await bot.sendPrivateImage("./demo.png");
 await bot.sendPrivateStream(markdownText);
-await bot.sendText({ type: "c2c", id: "USER_OPENID" }, "你好");
 ```
 
 ## 类型检查
@@ -181,4 +201,5 @@ npm run typecheck
 - 主动私信需要目标用户 openid。
 - QQ 平台可能限制主动消息发送频率和场景。
 - 流式消息当前封装的是 C2C 私信 markdown stream。
-- 本工具类只封装核心文本与流式文本能力，图片、语音、文件等富媒体能力未包含。
+- 图片发送会先调用 `/v2/users/{openid}/files` 获取 `file_info`，再发送 `msg_type: 7` 消息。
+- 本工具类只保留 C2C 私聊能力；群聊、频道、频道私信不在当前封装范围内。
