@@ -1,9 +1,21 @@
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
+export type QQBotTokenProvider = () => string | Promise<string>;
+
+export type QQBotImageInput =
+  | string
+  | Blob
+  | ArrayBuffer
+  | Uint8Array
+  | {
+      base64: string;
+      filename?: string;
+      contentType?: string;
+    };
 
 export interface QQBotApiToolOptions {
-  appId: string;
-  clientSecret: string;
+  appId?: string;
+  clientSecret?: string;
+  accessToken?: string;
+  tokenProvider?: QQBotTokenProvider;
   userOpenid?: string;
   logger?: Pick<Console, "log" | "warn" | "error">;
   apiBaseUrl?: string;
@@ -83,8 +95,10 @@ const C2C_INTENT = 1 << 25;
 const IMAGE_FILE_TYPE = 1;
 
 export class QQBotApiTool {
-  private readonly appId: string;
-  private readonly clientSecret: string;
+  private readonly appId?: string;
+  private readonly clientSecret?: string;
+  private readonly staticAccessToken?: string;
+  private readonly tokenProvider?: QQBotTokenProvider;
   private readonly userOpenid?: string;
   private readonly logger: Pick<Console, "log" | "warn" | "error">;
   private readonly apiBaseUrl: string;
@@ -101,10 +115,14 @@ export class QQBotApiTool {
   private messageHandlers: QQBotMessageHandler[] = [];
 
   constructor(options: QQBotApiToolOptions) {
-    this.appId = String(options.appId ?? "").trim();
-    this.clientSecret = String(options.clientSecret ?? "");
-    if (!this.appId) throw new Error("QQBot appId is required");
-    if (!this.clientSecret) throw new Error("QQBot clientSecret is required");
+    this.appId = options.appId === undefined ? undefined : String(options.appId).trim();
+    this.clientSecret = options.clientSecret === undefined ? undefined : String(options.clientSecret);
+    this.staticAccessToken = options.accessToken?.trim() || undefined;
+    this.tokenProvider = options.tokenProvider;
+    if (!this.staticAccessToken && !this.tokenProvider) {
+      if (!this.appId) throw new Error("QQBot appId is required unless accessToken or tokenProvider is provided");
+      if (!this.clientSecret) throw new Error("QQBot clientSecret is required unless accessToken or tokenProvider is provided");
+    }
 
     this.userOpenid = options.userOpenid?.trim() || undefined;
     this.logger = options.logger ?? console;
@@ -137,7 +155,7 @@ export class QQBotApiTool {
     return this.sendPrivateText(event.openid, text, event.messageId);
   }
 
-  async replyImage(event: QQBotMessageEvent, image: string): Promise<QQBotMessageResponse> {
+  async replyImage(event: QQBotMessageEvent, image: QQBotImageInput): Promise<QQBotMessageResponse> {
     return this.sendPrivateImageTo(event.openid, image, event.messageId);
   }
 
@@ -146,7 +164,7 @@ export class QQBotApiTool {
     return this.sendPrivateText(openid, text);
   }
 
-  async sendPrivateImage(image: string, openid = this.userOpenid): Promise<QQBotMessageResponse> {
+  async sendPrivateImage(image: QQBotImageInput, openid = this.userOpenid): Promise<QQBotMessageResponse> {
     if (!openid) throw new Error("sendPrivateImage requires userOpenid in constructor or as the second argument");
     return this.sendPrivateImageTo(openid, image);
   }
@@ -158,6 +176,9 @@ export class QQBotApiTool {
   }
 
   private async getAccessToken(): Promise<string> {
+    if (this.staticAccessToken) return this.staticAccessToken;
+    if (this.tokenProvider) return this.tokenProvider();
+
     const cached = this.tokenCache;
     const refreshAheadMs = cached ? Math.min(5 * 60 * 1000, (cached.expiresAt - Date.now()) / 3) : 0;
     if (cached && Date.now() < cached.expiresAt - refreshAheadMs) return cached.token;
@@ -169,7 +190,6 @@ export class QQBotApiTool {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "User-Agent": this.userAgent(),
           },
           body: JSON.stringify({ appId: this.appId, clientSecret: this.clientSecret }),
         });
@@ -326,7 +346,7 @@ export class QQBotApiTool {
     return this.apiRequest("POST", `/v2/users/${encodeURIComponent(openid)}/messages`, buildTextBody(content, msgId));
   }
 
-  private async sendPrivateImageTo(openid: string, image: string, msgId?: string): Promise<QQBotMessageResponse> {
+  private async sendPrivateImageTo(openid: string, image: QQBotImageInput, msgId?: string): Promise<QQBotMessageResponse> {
     const fileInfo = await this.uploadPrivateImage(openid, image);
     return this.apiRequest("POST", `/v2/users/${encodeURIComponent(openid)}/messages`, {
       msg_type: 7,
@@ -336,8 +356,8 @@ export class QQBotApiTool {
     });
   }
 
-  private async uploadPrivateImage(openid: string, image: string): Promise<string> {
-    const body = isHttpUrl(image)
+  private async uploadPrivateImage(openid: string, image: QQBotImageInput): Promise<string> {
+    const body = typeof image === "string" && isHttpUrl(image)
       ? {
           file_type: IMAGE_FILE_TYPE,
           url: image,
@@ -345,9 +365,9 @@ export class QQBotApiTool {
         }
       : {
           file_type: IMAGE_FILE_TYPE,
-          file_data: await fs.readFile(image, "base64"),
+          file_data: await imageToBase64(image),
           srv_send_msg: false,
-          file_name: path.basename(image),
+          ...imageFileName(image),
         };
 
     const result = await this.apiRequest<{ file_info?: string }>("POST", `/v2/users/${encodeURIComponent(openid)}/files`, body);
@@ -398,7 +418,6 @@ export class QQBotApiTool {
       headers: {
         "Authorization": `QQBot ${accessToken}`,
         "Content-Type": "application/json",
-        "User-Agent": this.userAgent(),
       },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
@@ -411,9 +430,6 @@ export class QQBotApiTool {
     return data as T;
   }
 
-  private userAgent(): string {
-    return `QQBotApiTool/1.0 Node/${process.versions.node}`;
-  }
 }
 
 export function normalizeMessageEvent(payload: WSPayload): QQBotMessageEvent | null {
@@ -467,19 +483,56 @@ function sleep(ms: number): Promise<void> {
 
 function getWebSocketConstructor(): WebSocketConstructor {
   const WebSocketCtor = (globalThis as unknown as { WebSocket?: WebSocketConstructor }).WebSocket;
-  if (!WebSocketCtor) throw new Error("global WebSocket is unavailable; run with Node.js 24+ or newer");
+  if (!WebSocketCtor) throw new Error("global WebSocket is unavailable");
   return WebSocketCtor;
 }
 
 async function webSocketDataToString(data: unknown): Promise<string> {
   if (typeof data === "string") return data;
   if (data instanceof ArrayBuffer) return new TextDecoder().decode(data);
-  if (data instanceof Blob) return data.text();
+  if (typeof Blob !== "undefined" && data instanceof Blob) return data.text();
   return String(data);
 }
 
 function isHttpUrl(value: string): boolean {
   return value.startsWith("http://") || value.startsWith("https://");
+}
+
+async function imageToBase64(image: QQBotImageInput): Promise<string> {
+  if (typeof image === "string") return stripDataUrlPrefix(image);
+  if (image instanceof ArrayBuffer) return bytesToBase64(new Uint8Array(image));
+  if (image instanceof Uint8Array) return bytesToBase64(image);
+  if (typeof Blob !== "undefined" && image instanceof Blob) return bytesToBase64(new Uint8Array(await image.arrayBuffer()));
+  if (isBase64ImageObject(image)) return stripDataUrlPrefix(image.base64);
+  throw new Error("unsupported image input");
+}
+
+function imageFileName(image: QQBotImageInput): { file_name?: string } {
+  if (isBase64ImageObject(image) && image.filename) return { file_name: image.filename };
+  return {};
+}
+
+function isBase64ImageObject(image: QQBotImageInput): image is { base64: string; filename?: string; contentType?: string } {
+  return typeof image === "object" && image !== null && "base64" in image;
+}
+
+function stripDataUrlPrefix(value: string): string {
+  const marker = ";base64,";
+  const index = value.indexOf(marker);
+  return index === -1 ? value : value.slice(index + marker.length);
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    const chunk = bytes.subarray(offset, offset + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+
+  const btoaFn = (globalThis as unknown as { btoa?: (value: string) => string }).btoa;
+  if (!btoaFn) throw new Error("global btoa is unavailable; pass image as base64 string instead");
+  return btoaFn(binary);
 }
 
 function parseJson<T>(text: string): T | null {
@@ -501,24 +554,4 @@ function formatError(err: unknown): string {
   } catch {
     return String(err);
   }
-}
-
-if (import.meta.url === `file://${process.argv[1]}`) {
-  const bot = new QQBotApiTool({
-    appId: process.env.QQBOT_APP_ID ?? "",
-    clientSecret: process.env.QQBOT_CLIENT_SECRET ?? "",
-    userOpenid: process.env.QQBOT_USER_OPENID,
-  });
-
-  bot.onMessage(async (event, api) => {
-    console.log(`[qqbot] private ${event.openid}: ${event.text}`);
-    if (event.text.trim() === "/ping") {
-      await api.reply(event, "pong");
-    }
-  });
-
-  bot.start().catch((err) => {
-    console.error(err);
-    process.exit(1);
-  });
 }

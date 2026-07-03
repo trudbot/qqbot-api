@@ -1,19 +1,19 @@
 # qqbot-api
 
-一个极简 TypeScript QQ Bot 私聊工具类：基于 QQ Bot WebSocket Gateway 在本地接收 C2C 私聊消息，并提供私聊文本、流式 Markdown、图片发送 API。
+一个极简 TypeScript QQ Bot 私聊工具类：基于 QQ Bot WebSocket Gateway 接收 C2C 私聊消息，并提供私聊文本、流式 Markdown、图片发送 API。
 
 特点：
 
-- 只支持 WebSocket 模式，本地运行即可接收 QQ 私聊消息，不需要公网 Webhook。
+- 只支持 WebSocket 模式，可接收 QQ 私聊消息，不需要公网 Webhook。
 - 只封装 C2C 私聊能力，避免群聊、频道、DM 等额外复杂度。
 - 不依赖 OpenClaw 仓库代码。
-- 不依赖第三方 WebSocket 包，要求 Node.js 24+。
+- 核心文件不 import `node:*`，浏览器和 Node 都能使用。
 - 对外 API 简洁：`start`、`stop`、`onMessage`、`reply`、`replyImage`、`sendPrivate`、`sendPrivateImage`、`sendPrivateStream`。
 
 ## 环境要求
 
-- Node.js 24+
-- QQ Bot 的 `appId` 和 `clientSecret`
+- Node.js 24+ 或现代浏览器
+- QQ Bot 的 `appId` 和 `clientSecret`，或后端提供的 `accessToken` / `tokenProvider`
 - QQ Bot 已开通 C2C 私聊消息事件权限
 
 ## 安装
@@ -44,6 +44,8 @@ QQBOT_USER_OPENID=可选，默认私聊用户 openid
 
 ## 最小接收和回复示例
 
+Node 里可以直接用 `appId` / `clientSecret`：
+
 ```ts
 import { QQBotApiTool } from "./qqbot-api-tool.ts";
 
@@ -63,24 +65,48 @@ bot.onMessage(async (event, api) => {
 await bot.start();
 ```
 
-运行后，本地程序会主动连接 QQ WebSocket Gateway。QQ 平台会沿这条连接推送私聊消息，所以不需要把本机 localhost 暴露给公网。
+浏览器里不要放 `clientSecret`，应该让你的后端返回 token：
+
+```ts
+const bot = new QQBotApiTool({
+  tokenProvider: async () => {
+    const response = await fetch("/api/qqbot-token");
+    const data = await response.json();
+    return data.accessToken;
+  },
+});
+```
+
+运行后，程序会主动连接 QQ WebSocket Gateway。QQ 平台会沿这条连接推送私聊消息，所以不需要把本机 localhost 暴露给公网。
 
 ## 回复图片
 
-`replyImage` 支持公网图片 URL 或本地图片路径：
+`replyImage` 支持公网图片 URL、`Blob`、`ArrayBuffer`、`Uint8Array` 或 base64：
 
 ```ts
 bot.onMessage(async (event, api) => {
   if (event.text.trim() === "/image") {
-    await api.replyImage(event, "./demo.png");
+    await api.replyImage(event, "https://example.com/demo.png");
   }
 });
 ```
 
-使用 URL：
+浏览器文件输入示例：
 
 ```ts
-await api.replyImage(event, "https://example.com/demo.png");
+const file = fileInput.files?.[0];
+if (file) {
+  await bot.sendPrivateImage(file);
+}
+```
+
+base64 示例：
+
+```ts
+await bot.sendPrivateImage({
+  base64: "iVBORw0KGgo...",
+  filename: "demo.png",
+});
 ```
 
 ## 主动发送私信
@@ -105,16 +131,22 @@ await bot.sendPrivate("你好", "USER_OPENID");
 
 ## 主动发送图片私信
 
-发送本地图片：
-
-```ts
-await bot.sendPrivateImage("./demo.png");
-```
-
 发送公网图片 URL：
 
 ```ts
-await bot.sendPrivateImage("https://example.com/demo.png", "USER_OPENID");
+await bot.sendPrivateImage("https://example.com/demo.png");
+```
+
+发送浏览器 `File` / `Blob`：
+
+```ts
+await bot.sendPrivateImage(file, "USER_OPENID");
+```
+
+发送 base64：
+
+```ts
+await bot.sendPrivateImage({ base64: "iVBORw0KGgo...", filename: "demo.png" });
 ```
 
 ## 流式发送私信
@@ -183,9 +215,9 @@ await bot.start();
 bot.stop();
 
 await bot.reply(event, "你好");
-await bot.replyImage(event, "./demo.png");
+await bot.replyImage(event, "https://example.com/demo.png");
 await bot.sendPrivate("你好");
-await bot.sendPrivateImage("./demo.png");
+await bot.sendPrivateImage(fileOrBlobOrBase64);
 await bot.sendPrivateStream(markdownText);
 ```
 
@@ -199,6 +231,8 @@ npm run typecheck
 
 - `openid` 不能通过 `appId` 和 `clientSecret` 拼接或计算得到。
 - 主动私信需要目标用户 openid。
+- 浏览器里不要暴露 `clientSecret`，请用后端提供 `accessToken` 或 `tokenProvider`。
+- QQ 平台 API 是否允许浏览器直连取决于 CORS；如果被拦截，需要经由你自己的后端代理发送。
 - QQ 平台可能限制主动消息发送频率和场景。
 - 流式消息当前封装的是 C2C 私信 markdown stream。
 - 图片发送会先调用 `/v2/users/{openid}/files` 获取 `file_info`，再发送 `msg_type: 7` 消息。
