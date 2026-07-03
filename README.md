@@ -8,7 +8,7 @@
 - 只封装 C2C 私聊能力，避免群聊、频道、DM 等额外复杂度。
 - 不依赖 OpenClaw 仓库代码。
 - 核心文件不 import `node:*`，浏览器和 Node 都能使用。
-- 对外 API 简洁：`start`、`stop`、`onMessage`、`reply`、`replyImage`、`sendPrivate`、`sendPrivateImage`、`sendPrivateStream`。
+- 对外 API 简洁：`start`、`stop`、`onMessage`、`reply`、`replyImage`、`replyStream`、`createReplyStream`、`sendPrivate`、`sendPrivateImage`、`sendPrivateStream`、`createPrivateStream`。
 
 ## 环境要求
 
@@ -149,14 +149,51 @@ await bot.sendPrivateImage(file, "USER_OPENID");
 await bot.sendPrivateImage({ base64: "iVBORw0KGgo...", filename: "demo.png" });
 ```
 
-## 流式发送私信
+## 流式回复和发送私信
 
 参考 QQ Bot markdown stream 消息接口实现。
+
+回复当前消息：
+
+```ts
+bot.onMessage(async (event, api) => {
+  if (event.text.trim() === "/stream") {
+    await api.replyStream(event, `# 流式回复
+
+你好，这是一条流式 Markdown 回复。`);
+  }
+});
+```
+
+主动发送：
 
 ```ts
 await bot.sendPrivateStream(`# 流式消息
 
 你好，这是一条流式 Markdown 私信。`);
+```
+
+接 LLM 流式输出时，用 writer API：
+
+```ts
+bot.onMessage(async (event, api) => {
+  const reply = api.createReplyStream(event);
+
+  for await (const chunk of llmStream) {
+    await reply.write(chunk);
+  }
+
+  await reply.close();
+});
+```
+
+主动私信也可以用 writer API：
+
+```ts
+const stream = bot.createPrivateStream("USER_OPENID");
+await stream.write("第一段");
+await stream.write("第二段");
+await stream.close();
 ```
 
 自定义分片大小和间隔：
@@ -216,9 +253,19 @@ bot.stop();
 
 await bot.reply(event, "你好");
 await bot.replyImage(event, "https://example.com/demo.png");
+await bot.replyStream(event, markdownText);
+
+const replyStream = bot.createReplyStream(event);
+await replyStream.write("第一段");
+await replyStream.close();
+
 await bot.sendPrivate("你好");
 await bot.sendPrivateImage(fileOrBlobOrBase64);
 await bot.sendPrivateStream(markdownText);
+
+const privateStream = bot.createPrivateStream("USER_OPENID");
+await privateStream.write("第一段");
+await privateStream.close();
 ```
 
 ## 类型检查
@@ -235,5 +282,6 @@ npm run typecheck
 - QQ 平台 API 是否允许浏览器直连取决于 CORS；如果被拦截，需要经由你自己的后端代理发送。
 - QQ 平台可能限制主动消息发送频率和场景。
 - 流式消息当前封装的是 C2C 私信 markdown stream。
+- `replyStream` 会在 stream 消息体里带上当前事件的 `msg_id`。
 - 图片发送会先调用 `/v2/users/{openid}/files` 获取 `file_info`，再发送 `msg_type: 7` 消息。
 - 本工具类只保留 C2C 私聊能力；群聊、频道、频道私信不在当前封装范围内。

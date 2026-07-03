@@ -55,6 +55,11 @@ export interface QQBotStreamOptions {
   intervalMs?: number;
 }
 
+export interface QQBotTextStream {
+  write(chunk: string): Promise<QQBotMessageResponse>;
+  close(finalText?: string): Promise<QQBotMessageResponse>;
+}
+
 export type QQBotMessageHandler = (event: QQBotMessageEvent, bot: QQBotApiTool) => void | Promise<void>;
 
 type WebSocketLike = {
@@ -159,6 +164,14 @@ export class QQBotApiTool {
     return this.sendPrivateImageTo(event.openid, image, event.messageId);
   }
 
+  async replyStream(event: QQBotMessageEvent, text: string, options: Omit<QQBotStreamOptions, "openid"> = {}): Promise<QQBotMessageResponse> {
+    return this.sendPrivateStreamTo(event.openid, text, options, event.messageId);
+  }
+
+  createReplyStream(event: QQBotMessageEvent, options: Omit<QQBotStreamOptions, "openid"> = {}): QQBotTextStream {
+    return this.createPrivateStreamTo(event.openid, options, event.messageId);
+  }
+
   async sendPrivate(text: string, openid = this.userOpenid): Promise<QQBotMessageResponse> {
     if (!openid) throw new Error("sendPrivate requires userOpenid in constructor or as the second argument");
     return this.sendPrivateText(openid, text);
@@ -173,6 +186,11 @@ export class QQBotApiTool {
     const openid = options.openid ?? this.userOpenid;
     if (!openid) throw new Error("sendPrivateStream requires userOpenid in constructor or options.openid");
     return this.sendPrivateStreamTo(openid, text, options);
+  }
+
+  createPrivateStream(openid = this.userOpenid, options: Omit<QQBotStreamOptions, "openid"> = {}): QQBotTextStream {
+    if (!openid) throw new Error("createPrivateStream requires userOpenid in constructor or as the first argument");
+    return this.createPrivateStreamTo(openid, options);
   }
 
   private async getAccessToken(): Promise<string> {
@@ -375,40 +393,61 @@ export class QQBotApiTool {
     return result.file_info;
   }
 
-  private async sendPrivateStreamTo(openid: string, content: string, options: QQBotStreamOptions): Promise<QQBotMessageResponse> {
-    const chunks = splitByLines(content, options.chunkSize ?? 50);
-    const intervalMs = options.intervalMs ?? 100;
+  private createPrivateStreamTo(openid: string, options: Omit<QQBotStreamOptions, "openid">, msgId?: string): QQBotTextStream {
     let streamId: string | null = null;
     let msgSeq = 1;
+    let index = 0;
+    let content = "";
+    let closed = false;
 
-    for (let index = 0; index < chunks.length; index += 1) {
-      const chunkResponse: QQBotMessageResponse = await this.apiRequest("POST", `/v2/users/${encodeURIComponent(openid)}/messages`, {
-        msg_type: 2,
-        markdown: { content: chunks[index] },
-        msg_seq: msgSeq,
-        stream: {
-          state: 1,
-          id: streamId,
-          index,
-          reset: false,
-        },
-      });
-      streamId = chunkResponse.id ?? streamId;
-      msgSeq += 1;
-      if (intervalMs > 0) await sleep(intervalMs);
-    }
-
-    return this.apiRequest("POST", `/v2/users/${encodeURIComponent(openid)}/messages`, {
-      msg_type: 2,
-      markdown: { content },
-      msg_seq: msgSeq,
-      stream: {
-        state: 10,
-        id: streamId,
-        index: 1,
-        reset: true,
+    return {
+      write: async (chunk: string) => {
+        if (closed) throw new Error("stream is already closed");
+        if (!chunk) throw new Error("stream chunk is required");
+        content += chunk;
+        const response: QQBotMessageResponse = await this.apiRequest("POST", `/v2/users/${encodeURIComponent(openid)}/messages`, {
+          msg_type: 2,
+          markdown: { content: chunk },
+          msg_seq: msgSeq,
+          ...(msgId ? { msg_id: msgId } : {}),
+          stream: {
+            state: 1,
+            id: streamId,
+            index,
+            reset: false,
+          },
+        });
+        streamId = response.id ?? streamId;
+        msgSeq += 1;
+        index += 1;
+        const intervalMs = options.intervalMs ?? 0;
+        if (intervalMs > 0) await sleep(intervalMs);
+        return response;
       },
-    });
+      close: async (finalText = content) => {
+        if (closed) throw new Error("stream is already closed");
+        closed = true;
+        return this.apiRequest("POST", `/v2/users/${encodeURIComponent(openid)}/messages`, {
+          msg_type: 2,
+          markdown: { content: finalText },
+          msg_seq: msgSeq,
+          ...(msgId ? { msg_id: msgId } : {}),
+          stream: {
+            state: 10,
+            id: streamId,
+            index: 1,
+            reset: true,
+          },
+        });
+      },
+    };
+  }
+
+  private async sendPrivateStreamTo(openid: string, content: string, options: Omit<QQBotStreamOptions, "openid">, msgId?: string): Promise<QQBotMessageResponse> {
+    const chunks = splitByLines(content, options.chunkSize ?? 50);
+    const stream = this.createPrivateStreamTo(openid, { ...options, intervalMs: options.intervalMs ?? 100 }, msgId);
+    for (const chunk of chunks) await stream.write(chunk);
+    return stream.close(content);
   }
 
   private async apiRequest<T>(method: string, path: string, body?: unknown, token?: string): Promise<T> {
